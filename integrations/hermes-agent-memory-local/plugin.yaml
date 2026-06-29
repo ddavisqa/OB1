@@ -1,0 +1,7 @@
+name: ob1-local
+version: 0.1.0
+description: "OpenBrain (OB1) local memory provider — ChromaDB + local embeddings. Auto-recall before each turn, auto-writeback after. Local-only, no cloud dependencies."
+pip_dependencies: []
+requires_env: []
+hooks:
+  - on_turn_start
