@@ -171,6 +171,15 @@ def _save_ob1_local_config(values: dict, hermes_home: str) -> None:
     config_path.write_text(json.dumps(existing, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def _build_where(*conditions) -> dict:
+    """Build a ChromaDB v2 where clause. ChromaDB v2 requires $and for multiple conditions."""
+    if not conditions:
+        return {}
+    if len(conditions) == 1:
+        return {conditions[0][0]: conditions[0][1]}
+    return {"$and": [{k: v} for k, v in conditions]}
+
+
 def _clean_text_for_capture(text: str) -> str:
     return _OB1_CONTEXT_STRIP_RE.sub("", text or "").strip()
 
@@ -820,11 +829,11 @@ class OB1LocalMemoryProvider(MemoryProvider):
             query_vec = self._embed_text(q)
 
             # Build ChromaDB where filter
-            workspace_id = self._config["workspace_id"]
-            where: Dict[str, Any] = {"workspace_id": workspace_id}
+            conditions = [("workspace_id", self._config["workspace_id"])]
             project_id = self._config["project_id"]
             if project_id:
-                where["project_id"] = project_id
+                conditions.append(("project_id", project_id))
+            where = _build_where(*conditions)
 
             response = self._chroma_client.query(
                 collection_name=self._config["chroma_collection"],
@@ -1131,10 +1140,11 @@ class OB1LocalMemoryProvider(MemoryProvider):
 
         try:
             query_vec = self._embed_text(query)
-            where: Dict[str, Any] = {"workspace_id": self._config["workspace_id"]}
+            conditions = [("workspace_id", self._config["workspace_id"])]
             content_type = args.get("content_type")
             if content_type:
-                where["content_type"] = str(content_type).lower()
+                conditions.append(("content_type", str(content_type).lower()))
+            where = _build_where(*conditions)
 
             response = self._chroma_client.query(
                 collection_name=self._config["chroma_collection"],
@@ -1231,10 +1241,11 @@ class OB1LocalMemoryProvider(MemoryProvider):
             limit = max(1, min(100, int(args.get("limit", 20))))
         except Exception:
             limit = 20
-        where: Dict[str, Any] = {"workspace_id": self._config["workspace_id"]}
+        conditions = [("workspace_id", self._config["workspace_id"])]
         content_type = args.get("content_type")
         if content_type:
-            where["content_type"] = str(content_type).lower()
+            conditions.append(("content_type", str(content_type).lower()))
+        where = _build_where(*conditions)
 
         try:
             response = self._chroma_client.get(
