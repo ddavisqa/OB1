@@ -23,7 +23,9 @@ from collections import defaultdict
 from datetime import datetime
 
 # ── Config ──────────────────────────────────────────────────────────────────
-FMP_API_KEY = "dcwdC5wb5fDmWOJbh82KoNVWqQGTVZYP"
+# Secret lives in ~/.hermes/.env (sourced by the cron wrapper). Never hardcode:
+# this repo's history is public-push-adjacent and a committed key leaks.
+FMP_API_KEY = os.environ.get("FMP_API_KEY", "").strip()
 FMP_BASE = "https://financialmodelingprep.com/stable"
 
 HOLDINGS_PATH = os.path.expanduser("~/Dropbox/Obsidian/Business/Holdings.md")
@@ -103,6 +105,8 @@ def _yf_sym(ticker):
 
 def _fmp_quote(symbol):
     """Fetch quote via FMP REST API. Returns (price, change_pct) or None."""
+    if not FMP_API_KEY:
+        return None
     url = f"{FMP_BASE}/quote?symbol={symbol}&apikey={FMP_API_KEY}"
     try:
         resp = urllib.request.urlopen(
@@ -271,6 +275,10 @@ def main():
         print("=" * 60)
         print("📊 WEEKLY PORTFOLIO ANALYSIS")
         print("=" * 60, "\n")
+
+    if not FMP_API_KEY:
+        print("  ⚠️  FMP_API_KEY not set — every ticker will fall back to yfinance")
+        print("      Set it in ~/.hermes/.env (the cron wrapper sources that file).\n")
 
     positions = load_positions()
     if not positions:
