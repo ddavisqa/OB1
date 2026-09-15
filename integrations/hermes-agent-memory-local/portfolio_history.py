@@ -28,6 +28,12 @@ from datetime import datetime
 VAULT = os.path.expanduser("~/Dropbox/Obsidian/Business/02_Areas/Finance")
 CSV_PATH = os.path.join(VAULT, "Portfolio History.csv")
 NOTE_PATH = os.path.join(VAULT, "Portfolio Performance.md")
+BM_CSV = os.path.join(VAULT, "Benchmark History.csv")
+CHART_BLOCK_PATH = os.path.expanduser("~/.hermes/scripts/portfolio_chart_block.md")
+
+# Empower's own class proxies (Index Descriptions panel)
+BENCH = [("US Equity", ["VTI"]), ("Foreign Equity", ["VEU"]), ("US Bond", ["AGG"]),
+         ("Foreign Bond", ["IGOV"]), ("Alternatives", ["VNQ", "IAU", "DBC"])]
 HOLDINGS = os.path.expanduser("~/Dropbox/Obsidian/Business/Holdings.md")
 QUIET = "--quiet" in sys.argv
 
@@ -134,6 +140,10 @@ def mermaid_chart(rows, cols):
 
 
 def build_note(rows):
+    try:
+        chart_block = open(CHART_BLOCK_PATH).read().strip()
+    except Exception:
+        chart_block = "_chart template missing at %s_" % CHART_BLOCK_PATH
     latest = rows[-1]
     first = rows[0]
     total = float(latest["total"])
@@ -183,12 +193,64 @@ _Running snapshot maintained by `portfolio_history.py`. The chart and tables bel
 |---|---:|---:|---:|---:|---:|---:|
 {hist}
 
+## Class vs benchmark — interactive
+
+{chart_block}
+
 ---
 
 _Source: `Holdings.md` share counts × live yfinance prices. Asset-class mapping per Empower's
 Index Descriptions (US Equity≈VTI, Foreign≈VEU, US Bond≈AGG, Foreign Bond≈IGOV,
 Alternatives≈VNQ/IAU/DBC). Crypto and cash are tracked outside the five-class benchmark._
 """
+
+
+def write_benchmark(weeks=14):
+    """Write cumulative index levels (base 100) for Empower's class proxies so the
+    interactive chart can compare the user's classes against the right benchmark."""
+    import yfinance as yf
+    syms = sorted({s for _, ts in BENCH for s in ts})
+    try:
+        df = yf.download(syms, period=f"{weeks + 1}wk", interval="1wk",
+                         progress=False, auto_adjust=True)["Close"]
+    except Exception:
+        return 0
+    if df is None or getattr(df, "empty", True):
+        return 0
+    df = df.ffill()
+    cols = ["date"] + [c.lower().replace(" ", "_") for c, _ in BENCH]
+    rows, base = [], None
+    for dt, r in df.iterrows():
+        vals = {}
+        for cname, syms_ in BENCH:
+            ps = []
+            for s in syms_:
+                if s not in df.columns:
+                    continue
+                try:
+                    v = float(r[s])
+                except Exception:
+                    continue
+                if v == v and v > 0:
+                    ps.append(v)
+            if not ps:
+                break
+            vals[cname] = sum(ps) / len(ps)
+        if len(vals) != len(BENCH):
+            continue
+        if base is None:
+            base = dict(vals)
+        rows.append({"date": dt.strftime("%Y-%m-%d"),
+                     **{c.lower().replace(" ", "_"): round(vals[c] / base[c] * 100, 3)
+                        for c in vals}})
+    tmp = BM_CSV + ".tmp"
+    with open(tmp, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+    os.replace(tmp, BM_CSV)
+    return len(rows)
 
 
 def read_rows():
@@ -248,6 +310,7 @@ def main():
     today = datetime.now().strftime("%Y-%m-%d")
 
     if "--backfill" in sys.argv:
+        nb = write_benchmark(14)
         n = backfill(13)
         rows = read_rows()
         if rows:
@@ -269,6 +332,7 @@ def main():
         row[c.lower().replace(" ", "_")] = round(vals[c], 2)
     row["other"] = round(vals["Other"], 2)
 
+    write_benchmark(14)
     rows, cols = write_csv(row)
     note = build_note(rows)
     tmp = NOTE_PATH + ".tmp"
