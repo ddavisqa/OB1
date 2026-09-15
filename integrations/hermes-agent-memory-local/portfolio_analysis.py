@@ -78,7 +78,10 @@ def load_positions():
         try:
             s = float(m.group(3).replace(",", ""))
             if s > 0:
-                positions[t] = s
+                # SUM, don't overwrite: the same ticker can be held in more than
+                # one account (e.g. VTI in both the brokerage and the Carry.com
+                # 401(k) roboadvisor). Overwriting silently dropped one account.
+                positions[t] = positions.get(t, 0.0) + s
         except Exception:
             pass
     return positions if positions else None

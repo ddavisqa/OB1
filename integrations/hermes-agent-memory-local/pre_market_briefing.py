@@ -84,7 +84,7 @@ def load_positions():
         text = open(HOLDINGS_MD).read()
         # Parse table rows: | TICKER | Name | Shares | Price | Value |
         for match in re.finditer(
-            r'\| +([A-Z][A-Z0-9.]+) +\| +([^|]+?) +\| +([\d,.]+) +\|',
+            r'\| +([A-Z][A-Z0-9.]*) +\| +([^|]+?) +\| +([\d,.]+) +\|',
             text
         ):
             ticker = match.group(1).strip()
@@ -94,7 +94,12 @@ def load_positions():
             except:
                 continue
             if shares > 0:
-                positions[ticker] = {"shares": shares, "source": "holdings_md"}
+                # SUM across accounts — the same ticker may appear in the main
+                # table AND the Carry.com 401(k) section; overwriting dropped one.
+                if ticker in positions:
+                    positions[ticker]["shares"] += shares
+                else:
+                    positions[ticker] = {"shares": shares, "source": "holdings_md"}
     
     if positions:
         return positions
