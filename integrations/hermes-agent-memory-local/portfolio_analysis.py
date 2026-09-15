@@ -33,7 +33,12 @@ HOLDINGS_PATH = os.path.expanduser("~/Dropbox/Obsidian/Business/Holdings.md")
 SECTOR_TARGETS = {
     "Aerospace & Defense": 0.15, "Broad Market": 0.26, "Technology": 0.12,
     "Dividend Income": 0.07, "Semiconductors": 0.08, "Infrastructure": 0.03,
-    "Crypto": 0.10, "Real Estate": 0.01, "Cash": 0.13,
+    "Crypto": 0.10, "Real Estate": 0.01,
+    # "Cash" = SECURITIES cash only (SWVXX money market). External cash, DTEM
+    # operating float and property reserves live in the vault "Cash & Reserves"
+    # note, NOT here. The old 0.13 assumed $20k of 401(k) cash that had already
+    # been invested, so it fired a permanent bogus "Buy $24,741" trigger.
+    "Cash": 0.07,
     "International Equity": 0.18,
 }
 # WARNING: these targets currently SUM TO 113% (95% pre-existing + 18% here).
