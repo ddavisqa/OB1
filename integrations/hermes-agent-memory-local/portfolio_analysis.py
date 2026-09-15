@@ -34,10 +34,13 @@ SECTOR_TARGETS = {
     "Aerospace & Defense": 0.15, "Broad Market": 0.26, "Technology": 0.12,
     "Dividend Income": 0.07, "Semiconductors": 0.08, "Infrastructure": 0.03,
     "Crypto": 0.10, "Real Estate": 0.01, "Cash": 0.13,
+    "International Equity": 0.18,
 }
+# WARNING: these targets currently SUM TO 113% (95% pre-existing + 18% here).
+# The blueprint predates the six newly-classified sleeves, so it is not a
+# coherent 100% allocation policy yet. Rebalance the set before acting on drift.
 # Any sector in SECTORS but absent from SECTOR_TARGETS is UNTARGETED: it is
 # still reported as a share of the book, but generates NO rebalance trigger.
-# Add a target here (e.g. "International Equity": 0.10) to start tracking drift.
 
 SECTORS = {
     "Aerospace & Defense": {"ITA","PPA","XAR","EUAD","SHLD","SAFRF","BAESF","EADSF","RYCEY","FINMF","RNMBF","ACHR","TKMSF"},
