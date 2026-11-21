@@ -21,6 +21,7 @@ import time
 import urllib.request
 from collections import defaultdict
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 # ── Config ──────────────────────────────────────────────────────────────────
 # Secret lives in ~/.hermes/.env (sourced by the cron wrapper). Never hardcode:
@@ -30,39 +31,69 @@ FMP_BASE = "https://financialmodelingprep.com/stable"
 
 HOLDINGS_PATH = os.path.expanduser("~/Dropbox/Obsidian/Business/Holdings.md")
 
-SECTOR_TARGETS = {
-    "Aerospace & Defense": 0.15, "Broad Market": 0.26, "Technology": 0.12,
-    "Dividend Income": 0.07, "Semiconductors": 0.08, "Infrastructure": 0.03,
-    "Crypto": 0.10, "Real Estate": 0.01,
-    # "Cash" = SECURITIES cash only (SWVXX money market). External cash, DTEM
-    # operating float and property reserves live in the vault "Cash & Reserves"
-    # note, NOT here. The old 0.13 assumed $20k of 401(k) cash that had already
-    # been invested, so it fired a permanent bogus "Buy $24,741" trigger.
-    "Cash": 0.07,
-    "International Equity": 0.18,
-}
-# WARNING: these targets currently SUM TO 113% (95% pre-existing + 18% here).
-# The blueprint predates the six newly-classified sleeves, so it is not a
-# coherent 100% allocation policy yet. Rebalance the set before acting on drift.
-# Any sector in SECTORS but absent from SECTOR_TARGETS is UNTARGETED: it is
-# still reported as a share of the book, but generates NO rebalance trigger.
+# Decision-integrity fail-close (2026-11-02): the parser omits pooled-plan,
+# target-date, option and non-ticker cash rows. The parsed denominator was about
+# 83.4% of the reconciled 2026-10-31 book, which can reverse a trade's direction.
+# Keep reporting observable prices/movers, but emit NO target drift or buy/sell
+# instruction until a complete-book loader and account-level funding model pass.
+REBALANCE_SIGNALS_ENABLED = False
+REBALANCE_BLOCK_REASON = (
+    "BLOCKED: incomplete book and withdrawn targets; no rebalance signal is decision-grade"
+)
+
+SECTOR_TARGETS = {}
+# All 2026-10-31 target values were withdrawn on 2026-11-02. They are absent,
+# not merely disabled, so toggling the report flag cannot resurrect a trade.
+# A future target set must be rebuilt from a complete book, validate to 100%,
+# and model account-level funding before any entries are added here.
+# ═══════════════════════════════════════════════════════════════════════════
+# USER PREFERENCE 2026-10-31 — "GROWTH, NEVER DRAW" (Damien, verbatim).
+# This is a preference, not proof that TLAP/Aucenta will always fund retirement.
+# The target changes below were withdrawn on 2026-11-02 pending a complete-book
+# loader, account-level execution plan, and explicit business-failure scenario.
+# SECTOR_TARGETS remains for historical comparison only while fail-closed.
+# Historical withdrawn proposal retained for audit:
+#   · Fixed Income 0%, Target-Date 0%, Dividend Income 5%
+#   · International 20%, Broad Market 30%, A&D 12%, Precious Metals 2%
+# These are not approved trade instructions while REBALANCE_SIGNALS_ENABLED is False.
+#
+# HISTORY: 2026-10-31 Crypto target retired (was 0.10) — position liquidated
+# 2026-06-16, realized 2026 loss -$16,029.66. Do NOT re-add without an explicit
+# new instruction.
+#
+# ⚠️ KNOWN PIPELINE GAP — the historical target set below is withdrawn and the
+# BOOK this script computes is still incomplete: `load_positions()` only matches `| TICKER |
+# name | shares |`, so it CANNOT see:
+#   · Target Ret 2040 Tr Sel      $38,161.53  (no ticker; trust-select class)
+#   · Spartan 500 Idx Pool Cl C    $8,718.41  (no ticker; plan CIT)
+#   · the two "Cash" rows         $16,317.93  (not a ticker)
+#   · B&W $9 call exp 11/20/26        $10.00
+# = $63,207.87 ≈ 15.1% of the book invisible to every weight below.
+# Weights computed here are therefore OF A SMALLER BOOK than reality. They are
+# not merely directional: the denominator error can reverse buy/sell direction.
+# Rebalance output is fail-closed above until synthetic/manual-value rows make
+# the loader complete and regression tests pass.
+# Any sector in SECTORS but absent from SECTOR_TARGETS is UNTARGETED: reported
+# as a share of the book, but generates NO rebalance trigger.
 
 SECTORS = {
-    "Aerospace & Defense": {"ITA","PPA","XAR","EUAD","SHLD","SAFRF","BAESF","EADSF","RYCEY","FINMF","RNMBF","ACHR","TKMSF"},
+    "Aerospace & Defense": {"ITA","PPA","XAR","EUAD","SHLD","SAFRF","BAESF","EADSF","RYCEY","FINMF","RNMBF","ACHR","TKMSF","TKCC"},
     "Semiconductors": {"SOXX","SMH","XSD","CHPX","NVDA"},
     "Technology": {"QQQ","XLK","CLOU","CIBR","KTEC","GOOG","AMZN","ONDS","BBAI"},
     "Infrastructure": {"GRID","IFRA","GLFOX","GRDU","NAT"},
     "Dividend Income": {"VIG","DIVO","VEIRX","DEM","IDV","DON","SDY","DES"},
     "Broad Market": {"SPY","SCHG","SCHK","ONEQ","FVAL","VSCIX","ESGV","DAX","VTI","VMCIX","BRK.B"},
     "International Equity": {"VSGX","VEA","VWO","VEMAX","VTSNX","ZIM","TYEKF"},
-    "Fixed Income": {"BND","BNDX","VCEB","VGIT","VGSH"},
-    "Precious Metals": {"SIVR"},
+    "Fixed Income": {"BND","BNDX","VCEB","VGIT","VGSH","VBTIX"},
+    "Precious Metals": {"SIVR","IAU"},   # SIVR sold 2026-10-05; IAU is the live precious-metal leg
+    "Commodities": {"PDBC"},              # diversified commodities; not a precious-metal holding
     "Currency": {"FXE"},
     "Healthcare": {"XLV"},
     "Consumer Discretionary": {"F"},
     "Real Estate": {"VGSLX","VNQ"},
     "Crypto": {"BTC.COIN","XRP.COIN"},
-    "Cash": {"SWVXX"},
+    "Cash": {"SWVXX","VMFXX"},
+    "Target-Date/Balanced": set(),   # no tickers yet — see PIPELINE GAP above
 }
 
 FX_EXPOSURE = {"EUAD", "SAFRF", "BAESF", "EADSF", "RYCEY", "DAX"}
@@ -139,7 +170,9 @@ def _yf_quote(ticker):
     try:
         import yfinance as yf
         tk = yf.Ticker(_yf_sym(ticker))
-        h = tk.history(period="2d")
+        # 5d, NOT 2d — a 2-day window drops symbols whose Yahoo daily bar lags (fund NAVs)
+        # and fails by time of day, producing phantom losses. See pre_market_briefing.py.
+        h = tk.history(period="5d")
         if h.empty:
             return None
         close = float(h["Close"].iloc[-1])
@@ -214,20 +247,33 @@ class Analysis:
             if tgt is None:          # untargeted sleeve — no drift signal
                 continue
             drift = ap - tgt
-            if abs(drift) > 0.05:
+            if REBALANCE_SIGNALS_ENABLED and abs(drift) > 0.05:
                 self.rebalance_triggers.append((s, ap, tgt, drift, "OVER" if drift > 0 else "UNDER"))
 
     def generate(self):
-        et = datetime.fromtimestamp(time.time() - 5 * 3600)
+        # Explicit IANA zone. The old form was
+        # `datetime.fromtimestamp(time.time() - 5*3600)` — a hardcoded -5h applied to an
+        # ALREADY-LOCAL timestamp, which is DST-blind and printed "07:56 ET" for a 12:56 ET run.
+        # Plain `datetime.now()` is not the fix either: Hermes can inject TZ=EST, which is a
+        # fixed -05:00 offset that ignores DST. Pin the real zone.
+        et = datetime.now(ZoneInfo("America/New_York"))
         lines = [f"📊 Weekly Portfolio Analysis — {et.strftime('%a %b %d, %Y')}", ""]
 
         n = len([t for t in self.prices if self.prices[t]])
         lines.append(f"**Portfolio Value:** ${self.portfolio:,.0f} ({n} positions)")
         lines.append("")
 
-        lines.append("**Sector Allocation vs Target:**")
+        if not REBALANCE_SIGNALS_ENABLED:
+            lines.append(f"🚫 **{REBALANCE_BLOCK_REASON}**")
+            lines.append("Observed percentages use the parsed subset only; no target comparison or trade amount follows.")
+            lines.append("")
+
+        lines.append("**Sector Allocation vs Target:**" if REBALANCE_SIGNALS_ENABLED else "**Observed sectors in parsed subset:**")
         for s in sorted(self.sector_pcts, key=lambda x: -self.sector_pcts[x]):
             ap = self.sector_pcts[s]
+            if not REBALANCE_SIGNALS_ENABLED:
+                lines.append(f"  {s:25s} {ap*100:5.1f}% of parsed subset")
+                continue
             tgt = SECTOR_TARGETS.get(s)
             if tgt is None:
                 lines.append(f"  {s:25s} {ap*100:5.1f}% (no target)      ⚪")
@@ -240,7 +286,7 @@ class Analysis:
                          f"{'🟢' if abs(drift)<0.05 else '🔴'}{m}")
         lines.append("")
 
-        if self.rebalance_triggers:
+        if REBALANCE_SIGNALS_ENABLED and self.rebalance_triggers:
             lines.append("**Rebalance Triggers (>5% drift):**")
             for s, ap, tgt, drift, d in sorted(self.rebalance_triggers, key=lambda x: -abs(x[3])):
                 amt = f"Sell ${self.portfolio*abs(drift):,.0f}" if d == "OVER" else f"Buy ${self.portfolio*abs(drift):,.0f}"
