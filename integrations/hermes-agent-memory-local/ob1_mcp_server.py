@@ -10,11 +10,13 @@ Usage:
 """
 
 import json
+import hashlib
 import os
 import sys
 import time
 import urllib.request
 import uuid
+from datetime import datetime, timezone
 
 # ---------------------------------------------------------------------------
 # ChromaDB + Ollama config
@@ -22,10 +24,64 @@ import uuid
 CHROMA = os.environ.get("OB1_CHROMA_URL", "http://localhost:8000")
 TENANT = "default_tenant"
 DATABASE = "default_database"
-COLL = "ob1_memory"
+COLL = os.environ.get("OB1_COLLECTION", "ob1_memory")
+WORKSPACE_ID = os.environ.get("OB1_WORKSPACE_ID", "ddavis")
+PROJECT_ID = os.environ.get("OB1_PROJECT_ID", "general").strip()
+RECALL_PROJECT_IDS = [
+    item.strip()
+    for item in os.environ.get("OB1_RECALL_PROJECT_IDS", PROJECT_ID).split(",")
+    if item.strip()
+]
 COLL_BASE = f"{CHROMA}/api/v2/tenants/{TENANT}/databases/{DATABASE}/collections"
 OLLAMA = os.environ.get("OB1_OLLAMA_URL", "http://localhost:11434/api/embeddings")
 OLLAMA_MODEL = os.environ.get("OB1_EMBED_MODEL", "nomic-embed-text")
+HTTP_HOST = os.environ.get("OB1_HTTP_HOST", "127.0.0.1")
+HTTP_PORT = int(os.environ.get("OB1_HTTP_PORT", "9100"))
+CORS_ORIGINS = {
+    origin.strip()
+    for origin in os.environ.get("OB1_CORS_ORIGINS", "").split(",")
+    if origin.strip()
+}
+MEMORY_SCHEMA_VERSION = 2
+
+
+def _is_financial_text(text):
+    lowered = (text or "").lower()
+    return any(term in lowered for term in (
+        "tax", "finance", "financial", "budget", "401k", "401(k)", "ira",
+        "mortgage", "income", "revenue", "portfolio", "retirement",
+        "brokerage", "dividend", "property tax",
+    ))
+
+
+def _memory_kind(content_type):
+    value = str(content_type or "").strip().lower()
+    return {
+        "fact": "user_fact", "decision": "decision", "lesson": "lesson",
+        "constraint": "constraint", "failure": "failure", "output": "output",
+        "next_step": "action_item", "mcp_capture": "observation",
+    }.get(value, "observation")
+
+
+def _metadata_in_scope(meta):
+    return (
+        isinstance(meta, dict)
+        and meta.get("workspace_id") == WORKSPACE_ID
+        and (not RECALL_PROJECT_IDS or meta.get("project_id") in RECALL_PROJECT_IDS)
+    )
+
+
+def _recallable(meta):
+    if not _metadata_in_scope(meta) or meta.get("review_status") == "rejected":
+        return False
+    expires_at = str(meta.get("expires_at") or "").strip()
+    if not expires_at:
+        return True
+    try:
+        expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+        return expiry > datetime.now(timezone.utc)
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +119,17 @@ def _embed(text):
         return json.loads(r.read()).get("embedding", [])
 
 
+def _scope_where():
+    clauses = [{"workspace_id": WORKSPACE_ID}]
+    if len(RECALL_PROJECT_IDS) == 1:
+        clauses.append({"project_id": RECALL_PROJECT_IDS[0]})
+    elif RECALL_PROJECT_IDS:
+        clauses.append({
+            "$or": [{"project_id": pid} for pid in RECALL_PROJECT_IDS]
+        })
+    return clauses[0] if len(clauses) == 1 else {"$and": clauses}
+
+
 # ---------------------------------------------------------------------------
 # Tool implementations
 # ---------------------------------------------------------------------------
@@ -79,7 +146,7 @@ def tool_search_thoughts(query: str, limit: int = 10) -> dict:
     resp = _http("POST", f"{COLL_BASE}/{CID}/query", {
         "query_embeddings": [vec],
         "n_results": min(limit, 50),
-        "where": {"workspace_id": "ddavis"},
+        "where": _scope_where(),
     })
     ids = resp.get("ids", [[]])[0]
     docs = resp.get("documents", [[]])[0]
@@ -88,10 +155,13 @@ def tool_search_thoughts(query: str, limit: int = 10) -> dict:
 
     results = []
     for i in range(len(ids)):
+        meta = metas[i] if i < len(metas) else {}
+        if not _recallable(meta):
+            continue
         results.append({
             "id": ids[i],
             "content": docs[i][:2000] if i < len(docs) else "",
-            "metadata": metas[i] if i < len(metas) else {},
+            "metadata": meta,
             "similarity": round(1.0 - dists[i], 4) if i < len(dists) else None,
         })
     return {"results": results, "count": len(results)}
@@ -101,6 +171,11 @@ def tool_capture_thought(content: str, tags: str = "",
                          content_type: str = "mcp_capture") -> dict:
     """Capture a new thought/memory into OpenBrain."""
     global CID
+    content = str(content or "").strip()
+    if not content:
+        raise ValueError("content is required")
+    if _is_financial_text(content):
+        raise ValueError("Financial memory capture is disabled for the general MCP bridge")
     if not CID:
         CID = _get_cid()
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -110,13 +185,25 @@ def tool_capture_thought(content: str, tags: str = "",
         "ids": [doc_id],
         "embeddings": [vec],
         "metadatas": [{
-            "workspace_id": "ddavis",
+            "workspace_id": WORKSPACE_ID,
             "content_type": content_type,
             "timestamp": ts,
             "tags": tags,
             "use_policy": "evidence",
             "confidence": 0.7,
             "source": "mcp_tool",
+            "project_id": PROJECT_ID,
+            "schema_version": MEMORY_SCHEMA_VERSION,
+            "memory_kind": _memory_kind(content_type),
+            "provenance_type": "mcp_client",
+            "provenance_ref": "local_mcp",
+            "capture_method": "mcp_tool",
+            "created_at": ts,
+            "updated_at": ts,
+            "expires_at": "",
+            "review_status": "pending",
+            "requires_review": True,
+            "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
         }],
         "documents": [content],
     })
@@ -128,14 +215,22 @@ def tool_stats() -> dict:
     global CID
     if not CID:
         CID = _get_cid()
-    try:
-        count = int(urllib.request.urlopen(
-            f"{COLL_BASE}/{CID}/count", timeout=5).read().decode())
-    except Exception:
-        count = 0
+    response = _http("POST", f"{COLL_BASE}/{CID}/get", {
+        "where": _scope_where(),
+        "limit": 99999,
+    })
+    metadatas = response.get("metadatas", []) or []
+    visible = [meta for meta in metadatas if _metadata_in_scope(meta)]
+    review_counts = {}
+    for meta in visible:
+        status = meta.get("review_status", "legacy_unreviewed")
+        review_counts[status] = review_counts.get(status, 0) + 1
     return {
-        "total_memories": count,
+        "total_memories": len(visible),
         "collection": COLL,
+        "workspace": WORKSPACE_ID,
+        "projects": RECALL_PROJECT_IDS,
+        "by_review_status": review_counts,
         "chroma_url": CHROMA,
         "embedding_model": OLLAMA_MODEL,
     }
@@ -303,8 +398,8 @@ def run_stdio():
             sys.stdout.flush()
 
 
-def run_http(host="0.0.0.0", port=9100):
-    """Run MCP server over HTTP (for testing)."""
+def run_http(host=HTTP_HOST, port=HTTP_PORT):
+    """Run the local MCP bridge over loopback HTTP by default."""
     from http.server import HTTPServer, BaseHTTPRequestHandler
 
     global CID
@@ -314,13 +409,32 @@ def run_http(host="0.0.0.0", port=9100):
         def _respond(self, code, body):
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", "*")
+            origin = self.headers.get("Origin", "")
+            if origin and origin in CORS_ORIGINS:
+                self.send_header("Access-Control-Allow-Origin", origin)
+                self.send_header("Vary", "Origin")
             self.end_headers()
             self.wfile.write(json.dumps(body).encode())
 
         def do_GET(self):
             if self.path == "/health":
-                self._respond(200, {"status": "ok", "collection": COLL})
+                try:
+                    embedding = _embed("ob1 dependency health check")
+                    count = tool_stats()["total_memories"]
+                    healthy = bool(embedding) and count >= 0
+                    self._respond(200 if healthy else 503, {
+                        "status": "ok" if healthy else "degraded",
+                        "collection": COLL,
+                        "workspace": WORKSPACE_ID,
+                        "projects": RECALL_PROJECT_IDS,
+                        "memory_count": count,
+                        "embedding_dimensions": len(embedding),
+                    })
+                except Exception as exc:
+                    self._respond(503, {
+                        "status": "degraded",
+                        "error_type": type(exc).__name__,
+                    })
             elif self.path == "/tools":
                 self._respond(200, {"tools": TOOL_DEFINITIONS})
             else:
@@ -343,6 +457,7 @@ def run_http(host="0.0.0.0", port=9100):
     print(f"OB1 MCP server listening on http://{host}:{port}")
     print(f"  Tools: ob1_search, ob1_capture, ob1_stats, ob1_recall_context")
     print(f"  Collection: {COLL}")
+    print(f"  Workspace: {WORKSPACE_ID}; projects: {RECALL_PROJECT_IDS}")
     print(f"  ChromaDB: {CHROMA}")
     print(f"  Embedding: {OLLAMA_MODEL} (Ollama)")
     HTTPServer((host, port), Handler).serve_forever()
@@ -350,6 +465,6 @@ def run_http(host="0.0.0.0", port=9100):
 
 if __name__ == "__main__":
     if "--http" in sys.argv:
-        run_http()
+        run_http(HTTP_HOST, HTTP_PORT)
     else:
         run_stdio()

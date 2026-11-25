@@ -19,11 +19,100 @@ import time
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 # Config
 CHROMA = "http://localhost:8000"
 FIRECRAWL_KEY = os.environ.get("FIRECRAWL_API_KEY", "")
 FIRECRAWL_SEARCH = "https://api.firecrawl.dev/v1/search"
+
+# ── Duplicate suppression ────────────────────────────────────────────────────────────────────
+# The briefing fires at 08:00 / 08:30 / 09:00 / 09:15. With no pre-open data movement those four
+# runs used to emit near-identical messages. Now each run compares its *material* numbers against
+# the last DELIVERED briefing of the same day and stays silent unless something actually changed.
+# The decision lives here rather than in the shell wrapper because the comparison needs real
+# numbers; a text hash in the wrapper was defeated by the freshness stamp, which advances every
+# minute and would have made every run look different.
+STATE_PATH = os.path.expanduser("~/.hermes/scripts/.premarket_brief_state.json")
+MATERIALITY_PCT = float(os.environ.get("BRIEF_MATERIALITY_PCT", "0.10"))
+
+
+def _load_state():
+    try:
+        with open(STATE_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_state(d):
+    try:
+        tmp = STATE_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(d, f)
+        os.replace(tmp, STATE_PATH)
+    except Exception as e:
+        sys.stderr.write(f"dedup: could not persist state ({e})\n")
+
+
+def _pub_epoch(content):
+    """Yahoo news `pubDate` (ISO-8601 Z) -> epoch seconds; 0.0 when absent/unparseable.
+
+    Used instead of comparing title sets: the feed reshuffles its window on every call, so
+    "a title I have not seen" is noisy, while "an article published after the last delivery"
+    is exactly the event worth interrupting someone for.
+    """
+    raw = content.get("pubDate") or content.get("displayTime")
+    if not raw:
+        return 0.0
+    try:
+        return datetime.strptime(str(raw)[:19], "%Y-%m-%dT%H:%M:%S").replace(
+            tzinfo=timezone.utc).timestamp()
+    except Exception:
+        return 0.0
+
+
+def should_deliver(b, today_iso):
+    """Return (deliver: bool, reason: str) for this run's briefing."""
+    if os.environ.get("BRIEF_DEDUP", "1") != "1":
+        return True, "dedup disabled (BRIEF_DEDUP!=1)"
+
+    s = getattr(b, "summary", None)
+    if not s:
+        return True, "no summary available"
+
+    st = _load_state()
+    if st.get("date") != today_iso:
+        return True, "first briefing of the day"
+
+    if int(st.get("priced", -1)) != int(s["priced"]):
+        return True, f"priced-position count changed ({st.get('priced')} -> {s['priced']})"
+    if int(st.get("errors", -1)) != int(s["errors"]):
+        return True, f"fetch-error count changed ({st.get('errors')} -> {s['errors']})"
+
+    try:
+        prev = float(st.get("value") or 0.0)
+    except (TypeError, ValueError):
+        prev = 0.0
+    if prev > 0:
+        delta = abs(s["value"] - prev) / prev * 100.0
+    else:
+        delta = 100.0
+    if delta >= MATERIALITY_PCT:
+        return True, f"portfolio moved {delta:.2f}% (threshold {MATERIALITY_PCT}%)"
+
+    if list(st.get("movers") or []) != list(s["movers"]):
+        return True, "notable-mover set changed"
+    # NOTE — the news feed is deliberately NOT a delivery trigger. Yahoo publishes continuously
+    # (a 4-run test fired on "article published since the last briefing" in 2 of the runs, 12
+    # seconds apart), and the sampled window varies with the mover set, so any freshness-based
+    # news trigger degenerates into "always deliver" — the exact spam being removed here.
+    # Headlines still ride along whenever a delivery happens for a real reason. `newest_pub` is
+    # recorded in the state file for provenance and future tuning.
+    # NOTE — the MarketWatch snapshot (Dow/S&P/Nasdaq/VIX...) is likewise NOT a trigger: it
+    # ticks continuously, so comparing it made every run look "changed".
+
+    return False, f"unchanged (portfolio {delta:.3f}% off the last briefing)"
 
 # Ticker → company name for news queries
 TICKER_NAMES = {
@@ -59,7 +148,15 @@ SECTORS = {
 
 
 def log(msg):
-    print(msg)
+    """Progress/diagnostic output.
+
+    Goes to STDERR on purpose: for a `no_agent` cron job, stdout is the delivered message, so
+    anything logged here would ship to Telegram. Worse, when duplicate suppression decides to
+    stay silent, a stdout-bound log line produces a non-empty message anyway — which is how a
+    58-byte "📊 Pre-Market Briefing (brief) / Fetching 62 tickers..." stub leaked through a
+    suppressed run on 2026-09-23. stderr is captured in the cron log and never delivered.
+    """
+    sys.stderr.write(msg + "\n")
 
 
 def get_cid():
@@ -132,7 +229,23 @@ class Briefing:
         self.brief_mode = brief_mode
         self.prices = {}
         self.errors = []
+        self.sessions = {}      # ticker -> "pre-market" | "market hours" | "after hours" | "previous close"
+        self.as_of = {}         # ticker -> tz-aware datetime of the bar the price came from
         self.timestamp = datetime.now(timezone.utc)
+
+    @staticmethod
+    def _session_of(ts):
+        """Classify an intraday bar timestamp (converted to ET) into a US session."""
+        try:
+            et = ts.tz_convert("America/New_York") if ts.tzinfo else ts
+            hm = et.hour * 60 + et.minute
+            if hm < 9 * 60 + 30:
+                return "pre-market"
+            if hm < 16 * 60:
+                return "market hours"
+            return "after hours"
+        except Exception:
+            return "intraday"
 
     def fetch_prices(self):
         """Fetch live prices via yfinance for all tickers individually."""
@@ -140,6 +253,9 @@ class Briefing:
 
         tickers = list(self.positions.keys())
         yahoo_tickers = []
+        # Rename map: yahoo symbol -> canonical Holdings.md symbol (results are always stored
+        # under the canonical key). yfinance wants dashes for dashed share classes.
+        yf_alias = {"BRK.B": "BRK-B"}
         crypto_map = {}
         for t in tickers:
             if t == "BTC.COIN":
@@ -149,7 +265,11 @@ class Briefing:
                 yahoo_tickers.append("XRP-USD")
                 crypto_map["XRP-USD"] = "XRP.COIN"
             else:
-                yahoo_tickers.append(t)
+                # yfinance wants dashes for dashed share classes (BRK.B -> BRK-B); store the
+                # result back under the canonical Holdings.md symbol via crypto_map.
+                yt = yf_alias.get(t, t)
+                yahoo_tickers.append(yt)
+                crypto_map[yt] = t
 
         if self.brief_mode:
             log(f"  Fetching {len(yahoo_tickers)} tickers...")
@@ -158,7 +278,11 @@ class Briefing:
             real_ticker = crypto_map.get(yt, yt)
             try:
                 tk = yf.Ticker(yt)
-                hist = tk.history(period="2d")
+                # 5d, NOT 2d. A 2-day window silently drops symbols whose Yahoo daily bar
+                # lags (mutual-fund NAVs post late), and it fails *by time of day*: the same
+                # run priced 61/62 at 08:00 and 55/62 at 12:54 on 2026-09-23, a phantom
+                # $33.7k "loss". 5d clears weekends/holidays and the NAV lag.
+                hist = tk.history(period="5d")
                 if hist.empty:
                     self.errors.append(f"{yt}: no data")
                     continue
@@ -166,14 +290,42 @@ class Briefing:
                 if close_series.empty:
                     self.errors.append(f"{yt}: no valid close prices")
                     continue
-                close = float(close_series.iloc[-1])
-                prev = float(close_series.iloc[-2]) if len(close_series) > 1 else None
-                chg = float((close - prev) / prev * 100) if prev and prev != 0 else 0
+                # Last COMPLETED session = the previous close. If today's daily bar already
+                # exists (i.e. we are after the close), step back one so we compare like with like.
+                series = close_series
+                try:
+                    today_et = datetime.now(ZoneInfo("America/New_York")).date()
+                    last_is_today = len(series) > 1 and series.index[-1].date() == today_et
+                except Exception:
+                    last_is_today = False
+                prev = float(series.iloc[-2] if last_is_today else series.iloc[-1])
+
+                # LIVE price: intraday bars INCLUDING extended hours. This is what makes the
+                # 08:00/08:30/09:00/09:15 briefings differ from one another — daily closes do not
+                # move before the open, so without this every slot re-reported the same numbers.
+                price = float(series.iloc[-1])
+                session = "previous close"
+                as_of = None
+                try:
+                    intra = tk.history(period="1d", interval="1m", prepost=True)
+                    if not intra.empty:
+                        ic = intra["Close"].dropna()
+                        if not ic.empty:
+                            price = float(ic.iloc[-1])
+                            as_of = ic.index[-1]
+                            session = self._session_of(as_of)
+                except Exception:
+                    pass
+
+                chg = float((price - prev) / prev * 100) if prev else 0.0
                 self.prices[real_ticker] = {
-                    "price": close,
+                    "price": price,
                     "prev_close": prev,
                     "change_pct": chg,
                 }
+                self.sessions[real_ticker] = session
+                if as_of is not None:
+                    self.as_of[real_ticker] = as_of
             except Exception as e:
                 self.errors.append(f"{yt}: {e}")
 
@@ -184,11 +336,30 @@ class Briefing:
         return "Other"
 
     def latest_close_time(self):
-        """Human-readable time of last price."""
-        now = datetime.now(timezone.utc)
-        if now.hour >= 13 and now.weekday() < 5:  # After 9 AM ET on weekdays
-            return "market hours"
-        return "previous close"
+        """Truthful freshness label, derived from the data rather than from the wall clock.
+
+        Replaces a hardcoded `if now.hour >= 13` UTC heuristic that labelled every run
+        "previous close" before 09:00 ET no matter what the data actually held — the reason
+        four consecutive briefings looked identical.
+        """
+        if not self.sessions:
+            return "no prices"
+        live = [t for t, s in self.sessions.items() if s != "previous close"]
+        if not live:
+            return "previous close"
+        counts = {}
+        for t in live:
+            counts[self.sessions[t]] = counts.get(self.sessions[t], 0) + 1
+        dominant = max(counts, key=counts.get)
+        if not self.as_of:
+            return f"{dominant} ({len(live)}/{len(self.sessions)} live)"
+        try:
+            newest = max(self.as_of.values())
+            et = newest.tz_convert("America/New_York") if newest.tzinfo else newest
+            return (f"{dominant} — {len(live)}/{len(self.sessions)} live, "
+                    f"last bar {et.strftime('%H:%M')} ET")
+        except Exception:
+            return f"{dominant} ({len(live)}/{len(self.sessions)} live)"
 
     def fetch_news(self, tickers, max_results=5):
         """Fetch news headlines via yfinance (Yahoo Finance API). Returns list of (ticker, title, url)."""
@@ -217,7 +388,7 @@ class Briefing:
                         continue
                     if title not in seen:
                         seen.add(title)
-                        headlines.append((ticker, title, url))
+                        headlines.append((ticker, title, url, _pub_epoch(content)))
                         per_ticker += 1
                         if per_ticker >= 2:  # max 2 per ticker
                             break
@@ -225,13 +396,36 @@ class Briefing:
                 self.errors.append(f"News fetch {ticker}: {e}")
         return headlines[:max_results]
 
+    def fetch_marketwatch(self):
+        """Fetch premium MarketWatch market data + headlines via Camofox browser session.
+
+        Returns dict with 'markets' and 'headlines' keys, or None if unavailable.
+        MarketWatch access requires the Camofox browser running on :9377 with the
+        Dow Jones SSO session active (ddavislogi@gmail.com)."""
+        try:
+            import subprocess
+            script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "marketwatch_data.py")
+            if not os.path.exists(script):
+                return None
+            r = subprocess.run(
+                ["/usr/bin/python3", script, "--all"],
+                capture_output=True, text=True, timeout=90,
+            )
+            if r.returncode != 0:
+                return None
+            return json.loads(r.stdout)
+        except Exception:
+            return None
+
     def generate(self):
         now_str = self.timestamp.strftime("%Y-%m-%d %H:%M UTC")
         brief = []
 
         # Header
-        est_offset = -5 if time.localtime().tm_isdst == 0 else -4
-        et = datetime.fromtimestamp(time.time() + est_offset * 3600)
+        # Same bug class as the one fixed in portfolio_analysis.py: a hardcoded DST guess
+        # (`-5 if tm_isdst == 0 else -4`) added on top of an ALREADY-LOCAL timestamp, which
+        # shifts the date in the small hours. Pin the IANA zone instead.
+        et = datetime.now(ZoneInfo("America/New_York"))
         brief.append(f"📊 Pre-Market Briefing — {et.strftime('%a %b %d, %Y')}")
         brief.append(f"   Prices: {self.latest_close_time()}")
         brief.append("")
@@ -307,13 +501,32 @@ class Briefing:
             brief.append("")
 
         # News (movers + top 5)
+        headlines = []
+        mkts = {}
         news_tickers = list(mover_tickers | set(top_tickers))
         if news_tickers and FIRECRAWL_KEY:
             headlines = self.fetch_news(news_tickers, max_results=5)
             if headlines:
                 brief.append("**📰 Recent Headlines:**")
-                for ticker, title, url in headlines:
+                for ticker, title, url, _pub in headlines:
                     brief.append(f"  [{ticker}] [{title}]({url})")
+                brief.append("")
+
+        # MarketWatch premium data (markets snapshot + top headlines)
+        mw = self.fetch_marketwatch()
+        if mw:
+            mkts = mw.get("markets") or {}
+            hdls = mw.get("headlines") or []
+            if mkts:
+                brief.append("**🌐 MarketWatch Snapshot:**")
+                for label in ("Dow", "S&P 500", "Nasdaq", "10Y Treasury", "WTI", "Gold", "Silver", "Bitcoin", "VIX"):
+                    if label in mkts:
+                        brief.append(f"  {label}: {mkts[label]}")
+                brief.append("")
+            if hdls:
+                brief.append("**📈 MarketWatch Headlines:**")
+                for h in hdls[:5]:
+                    brief.append(f"  • [{h['title']}]({h['url']})")
                 brief.append("")
 
         # Errors
@@ -336,6 +549,17 @@ class Briefing:
         # Timestamp
         brief.append(f"---")
         brief.append(f"Generated: {now_str}")
+
+        # Machine-readable summary for the duplicate-suppression decision (should_deliver).
+        self.summary = {
+            "value": round(total_value, 2),
+            "priced": priced_count,
+            "movers": sorted(mover_tickers),
+            "errors": len([e for e in self.errors if not e.startswith("News fetch")]),
+            "headlines": sorted(h[1] for h in headlines),
+            "newest_pub": max((h[3] for h in headlines), default=0.0),
+            "mw": sorted((k, str(v)) for k, v in mkts.items()),
+        }
 
         return "\n".join(brief)
 
@@ -376,6 +600,30 @@ def main():
         return
 
     result = b.generate()
+
+    today_iso = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+    deliver, why = should_deliver(b, today_iso)
+
+    if not deliver:
+        # Empty stdout: a no_agent cron job delivers nothing. Staying silent IS the feature.
+        sys.stderr.write(f"dedup: {why} — staying silent\n")
+        return
+
+    s = b.summary
+    seen_before = set((_load_state().get("headlines_seen") or []))
+    _save_state({
+        "date": today_iso,
+        "value": s["value"],
+        "priced": s["priced"],
+        "errors": s["errors"],
+        "movers": s["movers"],
+        "headlines": s["headlines"],
+        "newest_pub": s["newest_pub"],
+        "headlines_seen": sorted(seen_before | set(s["headlines"])),
+        "mw": s["mw"],
+        "delivered_at": datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M:%S %Z"),
+    })
+    sys.stderr.write(f"deliver: {why}\n")
     print(result)
 
 

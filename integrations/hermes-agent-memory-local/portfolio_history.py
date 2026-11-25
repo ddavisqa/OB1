@@ -43,17 +43,31 @@ CLASSES = ["US Equity", "Foreign Equity", "US Bond", "Foreign Bond", "Alternativ
 MAP = {
     "US Equity": {"SPY","SCHG","SCHK","ONEQ","FVAL","VTI","VMCIX","VSCIX","ESGV","BRK.B","GOOG","AMZN",
         "NVDA","QQQ","XLK","CLOU","CIBR","ONDS","BBAI","XLV","SOXX","SMH","SDY","DON","DES","VIG","DIVO",
-        "VEIRX","F","NAT","GRID","IFRA","ITA"},
+        "VEIRX","F","NAT","GRID","IFRA","ITA","ACHR"},
+        # ACHR moved here 2026-10-13: Archer Aviation is a US company (Santa Clara CA) and was
+        # misclassified as Foreign Equity, distorting both classes by $4.4K. Note the class series
+        # shifts at this date — see [[Foreign Equity — Audit 2026-10-13]].
     "Foreign Equity": {"VSGX","VEA","VWO","VEMAX","VTSNX","IDV","DEM","DAX","EUAD","SAFRF","BAESF",
-        "EADSF","RYCEY","FINMF","RNMBF","TKMSF","TYEKF","ZIM","KTEC","ACHR"},
+        "EADSF","RYCEY","FINMF","RNMBF","TKMSF","TYEKF","ZIM","KTEC"},
     "US Bond": {"BND","VCEB","VGIT","VGSH"},
     "Foreign Bond": {"BNDX"},
-    "Alternatives": {"VNQ","VGSLX","SIVR","FXE"},
+    # Alternatives = the benchmark's VNQ/IAU/DBC PLUS the legacy accident positions
+    # (SIVR, FXE). IAU/PDBC were missing here while BENCH already used VNQ/IAU/DBC, so
+    # gold and commodities silently fell through to "Other" and the sleeve looked
+    # collapsed after the 2026-10-06 rotation. Keep this in sync with BENCH.
+    "Alternatives": {"VNQ","VGSLX","SIVR","FXE","IAU","PDBC","DBC"},
     "Crypto": {"BTC.COIN","XRP.COIN"},
     "Cash": {"SWVXX"},
 }
 ALIAS = {"BRK.B": "BRK-B", "BTC.COIN": "BTC-USD", "XRP.COIN": "XRP-USD"}
 _CTX = ssl.create_default_context(); _CTX.check_hostname = False; _CTX.verify_mode = ssl.CERT_NONE
+
+# Symbols that returned no price on this run (populated by snapshot()). Reported so a
+# degraded run is diagnosable instead of just "N errors".
+FAILED = []
+
+# Attempts per symbol before declaring it unpriced. Yahoo drops symbols transiently.
+YF_RETRIES = 3
 
 
 def log(*a):
@@ -76,12 +90,29 @@ def load_positions():
 
 
 def yf_close(sym):
-    try:
-        import yfinance as yf
-        h = yf.Ticker(sym).history(period="2d")["Close"].dropna()
-        return float(h.iloc[-1]) if len(h) else None
-    except Exception:
-        return None
+    """Last close for `sym`, with retries.
+
+    Yahoo intermittently returns nothing for a symbol that priced seconds earlier.
+    A single miss silently drops that position from the total, and the error count
+    does NOT size the damage: on 2026-10-05 one missing GOOG (~$19.6K) moved the
+    book by -5.3%, while four missing micro-caps moved it by ~$4K. Retry before
+    giving up — a retry is far cheaper than a wrong chart.
+
+    5d window, NOT 2d — a 2-day window drops symbols whose Yahoo daily bar lags
+    (fund NAVs) and fails by time of day, producing phantom losses.
+    See pre_market_briefing.py.
+    """
+    for attempt in range(YF_RETRIES):
+        try:
+            import yfinance as yf
+            h = yf.Ticker(sym).history(period="5d")["Close"].dropna()
+            if len(h):
+                return float(h.iloc[-1])
+        except Exception:
+            pass
+        if attempt < YF_RETRIES - 1:
+            time.sleep(1.5 * (attempt + 1))
+    return None
 
 
 def classify(t):
@@ -100,6 +131,10 @@ def snapshot():
         p = yf_close(ALIAS.get(t, t))
         if p is None:
             errors += 1
+            # Name it. Without this the run just reports "N errors" and a wrong
+            # total, and nobody can tell which symbol or whether it matters.
+            FAILED.append(t)
+            log(f"   ⚠ no price returned for {t} (held {sh:g} sh)")
             continue
         priced += 1
         vals[classify(t)] += sh * p
@@ -113,8 +148,29 @@ def write_csv(row):
     if os.path.exists(CSV_PATH):
         with open(CSV_PATH) as f:
             existing = list(csv.DictReader(f))
-    existing = [r for r in existing if r.get("date") != row["date"]]
-    existing.append(row)
+
+    def _errs(r):
+        try:
+            return int(float(r.get("errors") or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    prior = next((r for r in existing if r.get("date") == row["date"]), None)
+    kept = [r for r in existing if r.get("date") != row["date"]]
+
+    # A same-date row may only be REPLACED by a COMPLETE run.
+    # Error *count* is not a proxy for damage: one missing GOOG (~$19.6K) distorted
+    # the book by -5.3% while four missing micro-caps moved it ~$4K. Any row with
+    # errors > 0 is an understated total, so it must never displace an existing row
+    # for the same date — the first partial result would win and stay wrong.
+    if prior is not None and _errs(row) > 0:
+        log(f"⚠ keeping existing {row['date']} row "
+            f"({prior.get('priced')} priced / {_errs(prior)} errors) — "
+            f"this run was incomplete ({row.get('priced')} priced / {_errs(row)} errors)")
+        kept.append(prior)
+    else:
+        kept.append(row)
+    existing = kept
     existing.sort(key=lambda r: r["date"])
     tmp = CSV_PATH + ".tmp"
     with open(tmp, "w", newline="") as f:
